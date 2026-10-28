@@ -3,7 +3,7 @@
 
 **Changes from v1.0:**
 - **V1 scope is Formula 1 only.** The other eight series remain fully planned (schema, data sources, roadmap) and ship one at a time post-launch.
-- **Frontend is Django-rendered templates** (HTMX + Alpine.js + Tailwind CSS). Next.js removed.
+- **Frontend is Django-rendered templates** (HTMX + Alpine.js + Bootstrap 5). Next.js removed.
 - **Real-time layer is Server-Sent Events (SSE)**, not Django Channels/WebSockets. Fewer moving parts, same UX at 5-second update rates.
 - **Auth is email/password + Google only** at launch (session-based, via django-allauth). Apple/Facebook deferred.
 - **Admin panel is Django's built-in admin**, extended with custom views only where needed.
@@ -236,7 +236,7 @@
 | Layer | Technology | Rationale |
 |---|---|---|
 | Web framework | Django 5 (ASGI via Uvicorn) | Batteries-included; templates, ORM, admin, auth |
-| Frontend | Django templates + HTMX + Alpine.js + Tailwind CSS | Server-rendered, SEO-native, no JS build complexity |
+| Frontend | Django templates + HTMX + Alpine.js + Bootstrap 5 | Server-rendered, SEO-native, no build step at all |
 | Real-time | Server-Sent Events (async Django views + Redis pub/sub) | One-way push is all we need at 5s cadence |
 | Async tasks | Celery + Celery Beat | Scheduled polling, background jobs |
 | Cache / Pub-Sub | Redis 7 | Fragment/view cache, SSE message broker, Celery broker |
@@ -317,8 +317,8 @@ pitwall/
 │   ├── emails/                 # notification email templates
 │   └── partials/               # HTMX fragments (timing table, standings rows…)
 ├── static/
-│   ├── css/                    # Tailwind output
-│   ├── js/                     # htmx.min.js, alpine.min.js, chart.min.js, sw.js
+│   ├── css/                    # bootstrap.min.css + pitwall.css (theme overrides)
+│   ├── js/                     # bootstrap.bundle.min.js, htmx.min.js, alpine.min.js, chart.min.js, sw.js
 │   └── img/series-logos/
 ├── requirements/
 │   ├── base.txt
@@ -328,7 +328,7 @@ pitwall/
 └── .env.example
 ```
 
-Tailwind is compiled with the **standalone Tailwind CLI** (via `django-tailwind-cli`) — no Node.js toolchain required. HTMX, Alpine.js, and Chart.js are vendored static files.
+Bootstrap 5, HTMX, Alpine.js, and Chart.js are all vendored static files — no Node.js toolchain or CSS build step. Brand theming lives in `static/css/pitwall.css` as Bootstrap CSS-variable overrides (`--bs-primary`, series accents, dark-mode tweaks).
 
 ---
 
@@ -1059,16 +1059,16 @@ templates/
 
 | Tool | Role |
 |---|---|
-| **Tailwind CSS** | All styling; compiled via standalone CLI (`django-tailwind-cli`), no Node |
+| **Bootstrap 5.3** | All styling + components (navbar, tabs, dropdowns, modals, toasts); vendored CSS/JS, customised via CSS-variable overrides in `pitwall.css` |
 | **HTMX** | Partial page updates, form posts, SSE extension for live fragments |
-| **Alpine.js** | Local interactivity: tabs, dropdowns, theme toggle, card-builder state |
+| **Alpine.js** | Local interactivity: theme toggle, countdowns, card-builder state (Bootstrap JS covers standard components) |
 | **Chart.js** | Championship gap bars, lap time charts, position progression |
 | **django-htmx** | Middleware + request helpers (`request.htmx`) |
 
 ### 12.3 Design System
 
 - **Typography:** Inter (sans) + JetBrains Mono (timing/numbers)
-- **Theme:** CSS variables for light/dark on `<html class="dark">`; Alpine toggle persisted to localStorage + user profile; respects `prefers-color-scheme` by default
+- **Theme:** Bootstrap 5.3 colour modes — `data-bs-theme="dark"` on `<html>`; Alpine toggle persisted to localStorage + user profile; respects `prefers-color-scheme` by default
 - **Team/series colours:** per-team CSS custom properties injected from DB values
 - **Live indicators:** pulsing red dot for LIVE sessions, amber for Safety Car
 - **Series identity:** each series gets its own accent colour (see Appendix A)
@@ -1320,7 +1320,7 @@ JOLPICA_BASE_URL=https://api.jolpi.ca/ergast
 | 1.1 | Project setup, Docker Compose local dev environment |
 | 1.2 | Django + PostgreSQL + Redis + Celery wired up; models + migrations |
 | 1.3 | F1 data ingestion (OpenF1 + Jolpica): drivers, teams, standings, calendar; **backfill 2020→current** |
-| 1.4 | Base templates + Tailwind + HTMX/Alpine scaffold; dark/light mode |
+| 1.4 | Base templates + Bootstrap 5 + HTMX/Alpine scaffold; dark/light mode |
 | 1.5 | Homepage + F1 series hub + standings pages |
 | 1.6 | Calendar + results list pages |
 | 1.7 | F1 round pages: race result, qualifying, pit stops, sector times |
