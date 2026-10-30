@@ -1,5 +1,7 @@
 # PitWall — Full Product & Technical Blueprint
-> Unified Motorsport Stats Hub · Version 1.2 · October 2026
+> Unified Motorsport Stats Hub · Version 1.3 · October 2026
+
+**Changes in v1.3:** active-pairing partial unique index + ingest flip rule, `notification_log` GDPR-safe FK, SSE fan-out snapshot iteration, `docs/` added to project tree.
 
 **Changes in v1.2:** audit hardening — schema unique constraints (results, pit stops, laps), SSE hub crash-recovery + framing contract, ops/compose details, GDPR-safe FKs.
 
@@ -337,6 +339,11 @@ pitwall/
 ├── requirements/
 │   ├── base.txt
 │   └── production.txt
+├── docs/
+│   ├── BLUEPRINT.md            # this document — single source of truth
+│   ├── DECISIONS.md            # one-line build decision log
+│   ├── DEPLOY.md               # Dokploy deployment guide (Phase 1.11)
+│   └── LAUNCH_CHECKLIST.md     # credentials/domain to fill in before launch
 ├── docker-compose.yml
 ├── docker-compose.prod.yml
 └── .env.example
@@ -435,7 +442,10 @@ CREATE TABLE driver_season_entries (
     is_active   BOOLEAN DEFAULT true,
     -- One row per driver-team pairing per season. Mid-season swaps = one row
     -- per team; A→B→A needs no third row because race_results snapshots the
-    -- team actually raced for. is_active marks the current pairing.
+    -- team actually raced for. is_active marks the current pairing: ingest
+    -- MUST set is_active = false on all existing (driver_id, season_id) rows
+    -- before inserting/re-activating the new one (enforced by the partial
+    -- unique index in §5.2).
     UNIQUE(driver_id, season_id, team_id)
 );
 
@@ -627,7 +637,7 @@ CREATE TABLE push_subscriptions (
 
 CREATE TABLE notification_log (
     id              SERIAL PRIMARY KEY,
-    user_id         UUID REFERENCES users(id),
+    user_id         UUID REFERENCES users(id) ON DELETE SET NULL,  -- keep de-identified log rows; GDPR delete must not fail
     channel         VARCHAR(20),
     event_type      VARCHAR(50),
     subject         VARCHAR(300),
@@ -673,6 +683,10 @@ CREATE INDEX idx_live_state_session ON live_session_state(session_id);
 CREATE INDEX idx_notif_log_sent_at ON notification_log(sent_at DESC);
 CREATE INDEX idx_notif_log_status ON notification_log(status);
 CREATE INDEX idx_ingest_log_source_time ON ingest_log(source, started_at DESC);
+
+-- At most one active team pairing per driver per season (see §5.1 entries note)
+CREATE UNIQUE INDEX uq_driver_season_active
+    ON driver_season_entries(driver_id, season_id) WHERE is_active;
 ```
 
 ---
@@ -821,7 +835,9 @@ async def _listener():
     await pubsub.psubscribe("live:*", "standings:*", "user:*")
     async for msg in pubsub.listen():
         if msg["type"] == "pmessage":
-            for q in _subscribers.get(msg["channel"].decode(), ()):
+            # Snapshot: guards against subscriber-set mutation if an await is
+            # ever added inside this loop body.
+            for q in list(_subscribers.get(msg["channel"].decode(), ())):
                 q.put_nowait(msg["data"].decode())
 
 def _clear_listener(task: asyncio.Task):
