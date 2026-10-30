@@ -1,5 +1,7 @@
 # PitWall — Full Product & Technical Blueprint
-> Unified Motorsport Stats Hub · Version 1.1 · October 2026
+> Unified Motorsport Stats Hub · Version 1.2 · October 2026
+
+**Changes in v1.2:** audit hardening — schema unique constraints (results, pit stops, laps), SSE hub crash-recovery + framing contract, ops/compose details, GDPR-safe FKs.
 
 **Changes from v1.0:**
 - **V1 scope is Formula 1 only.** The other eight series remain fully planned (schema, data sources, roadmap) and ship one at a time post-launch.
@@ -431,7 +433,10 @@ CREATE TABLE driver_season_entries (
     season_id   INTEGER REFERENCES seasons(id),
     car_number  INTEGER,
     is_active   BOOLEAN DEFAULT true,
-    UNIQUE(driver_id, season_id, team_id)  -- one row per stint: supports mid-season team swaps
+    -- One row per driver-team pairing per season. Mid-season swaps = one row
+    -- per team; A→B→A needs no third row because race_results snapshots the
+    -- team actually raced for. is_active marks the current pairing.
+    UNIQUE(driver_id, season_id, team_id)
 );
 
 -- ─── STANDINGS ───────────────────────────────────────────────
@@ -484,7 +489,8 @@ CREATE TABLE race_results (
     fastest_lap     BOOLEAN DEFAULT false,
     fastest_lap_time VARCHAR(20),
     fastest_lap_number INTEGER,
-    class           VARCHAR(50)
+    class           VARCHAR(50),
+    UNIQUE(session_id, driver_id)  -- idempotent ingest: update_or_create key
 );
 
 -- ─── F1-SPECIFIC: PIT STOPS ──────────────────────────────────
@@ -497,7 +503,8 @@ CREATE TABLE pit_stops (
     lap             INTEGER,
     duration_ms     INTEGER,
     compound_in     VARCHAR(20),  -- SOFT|MEDIUM|HARD|INTER|WET
-    compound_out    VARCHAR(20)
+    compound_out    VARCHAR(20),
+    UNIQUE(session_id, driver_id, stop_number)  -- idempotent ingest
 );
 
 -- ─── F1-SPECIFIC: SECTOR / LAP TIMES ────────────────────────
@@ -513,7 +520,8 @@ CREATE TABLE lap_times (
     sector3_ms      INTEGER,
     compound        VARCHAR(20),
     is_personal_best BOOLEAN DEFAULT false,
-    is_session_best  BOOLEAN DEFAULT false
+    is_session_best  BOOLEAN DEFAULT false,
+    UNIQUE(session_id, driver_id, lap_number)  -- idempotent ingest
 );
 -- lap_times grows fast: ~1,100 rows per race, ~150k+ over a 5-season backfill
 -- before practice/quali laps. The (session_id, driver_id) index below is
@@ -648,7 +656,7 @@ CREATE TABLE announcements (
     is_active   BOOLEAN DEFAULT false,
     starts_at   TIMESTAMPTZ,
     ends_at     TIMESTAMPTZ,
-    created_by  UUID REFERENCES users(id)
+    created_by  UUID REFERENCES users(id) ON DELETE SET NULL  -- GDPR deletion must never be blocked
 );
 ```
 
@@ -816,10 +824,17 @@ async def _listener():
             for q in _subscribers.get(msg["channel"].decode(), ()):
                 q.put_nowait(msg["data"].decode())
 
+def _clear_listener(task: asyncio.Task):
+    # If the listener dies (e.g. Redis blip), clear the handle so the next
+    # subscribe() restarts it — otherwise SSE silently goes dead in this worker.
+    global _listener_task
+    _listener_task = None
+
 async def subscribe(channel: str) -> asyncio.Queue:
     global _listener_task
-    if _listener_task is None:
+    if _listener_task is None or _listener_task.done():
         _listener_task = asyncio.get_running_loop().create_task(_listener())
+        _listener_task.add_done_callback(_clear_listener)
     q = asyncio.Queue()
     _subscribers.setdefault(channel, set()).add(q)
     return q
@@ -847,7 +862,7 @@ async def live_session_stream(request, session_id: int):
             while True:
                 try:
                     frame = await asyncio.wait_for(q.get(), timeout=15)
-                    yield frame + "\n\n"
+                    yield frame + "\n\n"  # frames arrive WITHOUT trailing newlines (see contract below)
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"  # 15s heartbeat — survives nginx/mobile idle timeouts
         finally:
@@ -859,7 +874,7 @@ async def live_session_stream(request, session_id: int):
     return response
 ```
 
-The Celery poller publishes pre-formatted SSE frames (`event: …\ndata: …`) and also writes the latest snapshot to a Redis key so new connections render immediately. Because Redis pub/sub broadcasts to **every** subscriber, the hub makes multi-worker Uvicorn safe: each worker holds exactly one pub/sub connection regardless of viewer count.
+**Framing contract (publisher ↔ view):** the Celery poller publishes complete SSE frames **without trailing newlines** (`event: timing_update\ndata: {…}`); the view appends exactly one `\n\n` terminator. Never publish frames with trailing newlines — an extra blank line splits one event into two in the browser. The snapshot key stores only the bare JSON payload of the last `timing_update`; the view adds full framing when serving it. Because Redis pub/sub broadcasts to **every** subscriber, the hub makes multi-worker Uvicorn safe: each worker holds exactly one pub/sub connection regardless of viewer count.
 
 ### 7.5 Client Side (HTMX SSE extension)
 
@@ -984,6 +999,7 @@ from pywebpush import webpush, WebPushException
 import json
 
 def send_push(subscription, title, body, url=None, icon=None):
+    """Call only from Celery tasks — blocking HTTP (requests); never from async views."""
     try:
         webpush(
             subscription_info={
@@ -1256,7 +1272,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.prod
-    # Multi-worker is SSE-safe: each worker runs its own fan-out hub (§7.4)
+    # Multi-worker is SSE-safe: each worker runs its own fan-out hub (§7.4).
+    # Dev compose uses `--workers 1 --reload` — uvicorn reload is single-worker only.
     command: uvicorn pitwall.asgi:application --host 0.0.0.0 --port 8000 --workers 4
     environment:
       - DATABASE_URL=postgresql://pitwall:${DB_PASSWORD}@postgres:5432/pitwall
