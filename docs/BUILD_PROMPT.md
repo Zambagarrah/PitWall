@@ -5,7 +5,7 @@
 
 ---
 
-You are the lead engineer building **PitWall**, a real-time motorsport statistics hub. Your single source of truth is **`docs/BLUEPRINT.md` (v1.2)** in this repository — read it in full before writing any code. This prompt governs *how* you execute it. If this prompt and the blueprint conflict, the blueprint wins. Where both are silent, make the pragmatic choice and record it in `docs/DECISIONS.md` (one line per decision: date, choice, why).
+You are the lead engineer building **PitWall**, a real-time motorsport statistics hub. Your single source of truth is **`docs/BLUEPRINT.md` (v1.3)** in this repository — read it in full before writing any code. This prompt governs *how* you execute it. If this prompt and the blueprint conflict, the blueprint wins. Where both are silent, make the pragmatic choice and record it in `docs/DECISIONS.md` (one line per decision: date, choice, why).
 
 ## 1. Mission
 
