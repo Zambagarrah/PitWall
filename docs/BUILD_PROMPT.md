@@ -5,7 +5,7 @@
 
 ---
 
-You are the lead engineer building **PitWall**, a real-time motorsport statistics hub. Your single source of truth is **`docs/BLUEPRINT.md` (v1.1)** in this repository — read it in full before writing any code. This prompt governs *how* you execute it. If this prompt and the blueprint conflict, the blueprint wins. Where both are silent, make the pragmatic choice and record it in `docs/DECISIONS.md` (one line per decision: date, choice, why).
+You are the lead engineer building **PitWall**, a real-time motorsport statistics hub. Your single source of truth is **`docs/BLUEPRINT.md` (v1.2)** in this repository — read it in full before writing any code. This prompt governs *how* you execute it. If this prompt and the blueprint conflict, the blueprint wins. Where both are silent, make the pragmatic choice and record it in `docs/DECISIONS.md` (one line per decision: date, choice, why).
 
 ## 1. Mission
 
@@ -52,7 +52,7 @@ Build PitWall v1 end to end — blueprint Phases 1–4 — as a production-ready
 - Reconciliation: OpenF1 data is provisional; Jolpica canonical results overwrite after each round.
 
 ### Live layer
-- SSE exactly per blueprint §7: async view, Redis pub/sub, named events, snapshot key for late joiners, 15s heartbeat comment, `X-Accel-Buffering: no`.
+- SSE exactly per blueprint §7: async view, per-worker Redis fan-out hub (one pub/sub connection per worker process — safe under multi-worker Uvicorn), named events, snapshot key for late joiners, 15s heartbeat comment, `X-Accel-Buffering: no`.
 - **Build a replay simulator with the live layer, not after**: `python manage.py simulate_live <session_id> [--speed 10]` replays synthetic (or recorded OpenF1) frames through the *real* pipeline (Redis publish → SSE → UI), so live timing is fully demoable and testable off-season. This is the acceptance vehicle for all live features.
 
 ### Correctness edge cases (all must be handled and tested)
@@ -80,7 +80,7 @@ Build PitWall v1 end to end — blueprint Phases 1–4 — as a production-ready
 
 ### Notifications (Phase 2)
 - Preference matrix (channel × event type × entity) enforced in a single dispatch service; every send logged to `notification_log`.
-- Web Push via pywebpush + VAPID (document key generation in README); prune subscriptions on 410; service worker `static/js/sw.js` handles push + notificationclick.
+- Web Push via pywebpush + VAPID (document key generation in README); prune subscriptions on 404/410; service worker `static/js/sw.js` handles push + notificationclick.
 - Emails: HTML + plain-text alternatives for every template.
 
 ### Security & settings

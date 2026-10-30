@@ -220,12 +220,24 @@
 
 | Mode | Interval | Trigger |
 |---|---|---|
-| Race weekend (live session) | 5 seconds | Session state = LIVE |
-| Race weekend (between sessions) | 60 seconds | Session state = PAUSED |
+| Race weekend (live session, incl. red-flag `paused`) | 5 seconds | Session state = LIVE / PAUSED |
+| Race weekend (between sessions) | 60 seconds | Weekend mode: round live, no session live |
 | Off-season / week between rounds | 15 minutes | Default |
 | Post-race data (pit stops, sectors) | On-demand after chequered flag | Session state = FINISHED |
 
 **Dispatcher pattern (instead of static 5s beat entries):** a lightweight `tick` task runs every minute via Celery Beat, checks session states in the DB, and sets a Redis flag when a session is LIVE. A self-rescheduling fast-poll task loops at 5s **only while the flag is set**, so nothing hammers external APIs off-season.
+
+### 3.5 Management Commands & Ingest Logging
+
+| Command | Purpose |
+|---|---|
+| `manage.py seed_series` | Idempotently creates the 9 `series` rows (only F1 `is_active`) and default `duration_mins` per session type (FP/Q = 60, sprint quali = 45…). Safe to re-run. |
+| `manage.py backfill_f1 --from-season 2020 [--delay 0.3] [--resume]` | Backfills seasons → rounds → sessions → drivers → teams → entries → results → qualifying → standings from Jolpica. Throttled to **≤4 req/s and ≤500 req/h** (hard Jolpica limits); a full 2020→current backfill is ~1,000+ calls, so expect **2–3 hours**. Progress is checkpointed per round in `ingest_log`, so an interrupted run resumes instead of restarting. |
+| `manage.py simulate_live <session_id> [--speed 10] [--source frames.json]` | Replays recorded OpenF1 frames (or synthetic data) through the **real** pipeline — writes `live_session_state`, publishes SSE frames to the Redis channel, refreshes the snapshot key — at `--speed`× real time. Built **with** the live layer, not after: it is the acceptance vehicle for all live features off-season. |
+
+Every ingest run writes an `ingest_log` row (source, task, started/finished, status, message, items written). The latest success timestamp per source powers:
+- the **admin health dashboard** (§11.3), and
+- a public **"Data updated X ago" badge** on standings/results pages whenever the source is stale (> 2× its expected refresh interval) — source downtime serves stale DB data, never a 500.
 
 ---
 
@@ -292,8 +304,7 @@ pitwall/
 │   │   ├── development.py
 │   │   └── production.py
 │   ├── urls.py
-│   ├── asgi.py                 # Uvicorn entry point (SSE needs ASGI)
-│   ├── wsgi.py
+│   ├── asgi.py                 # Uvicorn entry point (ASGI-only deploy; no wsgi.py)
 │   └── celery.py
 ├── apps/
 │   ├── accounts/               # User model, allauth config, profiles
@@ -305,7 +316,8 @@ pitwall/
 │   ├── sharing/                # Card generation
 │   └── ingest/                 # Celery tasks + API clients (per series)
 │       ├── clients/            # openf1.py, jolpica.py, (later: wrc.py, …)
-│       └── tasks/              # f1.py, dispatcher.py, (later per series)
+│       ├── tasks/              # f1.py, dispatcher.py, (later per series)
+│       └── management/commands/  # seed_series.py, backfill_f1.py, simulate_live.py
 ├── templates/
 │   ├── base.html               # Theme, nav, htmx/alpine includes
 │   ├── home.html               # Series cards overview
@@ -319,7 +331,7 @@ pitwall/
 ├── static/
 │   ├── css/                    # bootstrap.min.css + pitwall.css (theme overrides)
 │   ├── js/                     # bootstrap.bundle.min.js, htmx.min.js, alpine.min.js, chart.min.js, sw.js
-│   └── img/series-logos/
+│   └── img/series-badges/      # generated placeholder SVGs only — never official logos
 ├── requirements/
 │   ├── base.txt
 │   └── production.txt
@@ -368,7 +380,7 @@ CREATE TABLE rounds (
     circuit_name    VARCHAR(200),
     country         VARCHAR(100),
     city            VARCHAR(100),
-    status          VARCHAR(20) DEFAULT 'upcoming',  -- upcoming|live|completed
+    status          VARCHAR(20) DEFAULT 'upcoming',  -- upcoming|live|completed|cancelled|postponed
     round_start     TIMESTAMPTZ,
     round_end       TIMESTAMPTZ,
     UNIQUE(season_id, round_number)
@@ -379,12 +391,15 @@ CREATE TABLE sessions (
     round_id        INTEGER REFERENCES rounds(id),
     session_type    VARCHAR(30),  -- practice1|practice2|qualifying|sprint_quali|sprint|race
     scheduled_at    TIMESTAMPTZ,
-    status          VARCHAR(20) DEFAULT 'upcoming',  -- upcoming|live|finished
-    duration_mins   INTEGER
+    status          VARCHAR(20) DEFAULT 'upcoming',  -- upcoming|live|paused|finished|cancelled|postponed
+    duration_mins   INTEGER        -- seeded with per-type defaults (FP/Q = 60, sprint quali = 45, …)
 );
 
 -- ─── DRIVERS & TEAMS ─────────────────────────────────────────
 
+-- NOTE: team identity is deliberately per-series. Cross-series career views
+-- aggregate by driver, not team; add a canonical team grouping post-launch
+-- only if a cross-series team page is ever needed.
 CREATE TABLE teams (
     id              SERIAL PRIMARY KEY,
     series_id       INTEGER REFERENCES series(id),
@@ -416,7 +431,7 @@ CREATE TABLE driver_season_entries (
     season_id   INTEGER REFERENCES seasons(id),
     car_number  INTEGER,
     is_active   BOOLEAN DEFAULT true,
-    UNIQUE(driver_id, season_id)
+    UNIQUE(driver_id, season_id, team_id)  -- one row per stint: supports mid-season team swaps
 );
 
 -- ─── STANDINGS ───────────────────────────────────────────────
@@ -434,7 +449,10 @@ CREATE TABLE driver_standings (
     poles           INTEGER DEFAULT 0,
     fastest_laps    INTEGER DEFAULT 0,
     class           VARCHAR(50),   -- for WEC/GT class splits
-    updated_at      TIMESTAMPTZ DEFAULT NOW()
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    -- PG16: one row per driver per snapshot; round_id NULL = current.
+    -- Required for update_or_create to update instead of appending.
+    UNIQUE NULLS NOT DISTINCT (season_id, round_id, driver_id)
 );
 
 CREATE TABLE team_standings (
@@ -446,7 +464,8 @@ CREATE TABLE team_standings (
     points          NUMERIC(8,2),
     wins            INTEGER DEFAULT 0,
     class           VARCHAR(50),
-    updated_at      TIMESTAMPTZ DEFAULT NOW()
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE NULLS NOT DISTINCT (season_id, round_id, team_id)
 );
 
 -- ─── RACE RESULTS ────────────────────────────────────────────
@@ -496,6 +515,9 @@ CREATE TABLE lap_times (
     is_personal_best BOOLEAN DEFAULT false,
     is_session_best  BOOLEAN DEFAULT false
 );
+-- lap_times grows fast: ~1,100 rows per race, ~150k+ over a 5-season backfill
+-- before practice/quali laps. The (session_id, driver_id) index below is
+-- critical; partition by season if it ever becomes a problem.
 
 -- ─── WRC-SPECIFIC: STAGES (populated post-launch) ───────────
 
@@ -540,7 +562,7 @@ CREATE TABLE live_session_state (
     session_id      INTEGER UNIQUE REFERENCES sessions(id),
     current_lap     INTEGER,
     total_laps      INTEGER,
-    session_time    VARCHAR(20),
+    session_elapsed_ms INTEGER,    -- elapsed ms (sortable/computable; formatted in templates)
     safety_car      BOOLEAN DEFAULT false,
     virtual_sc      BOOLEAN DEFAULT false,
     red_flag        BOOLEAN DEFAULT false,
@@ -589,7 +611,7 @@ CREATE TABLE notification_preferences (
 CREATE TABLE push_subscriptions (
     id              SERIAL PRIMARY KEY,
     user_id         UUID REFERENCES users(id) ON DELETE CASCADE,
-    endpoint        TEXT NOT NULL,
+    endpoint        TEXT NOT NULL UNIQUE,  -- re-subscribes update_or_create on endpoint; no dupes
     p256dh          TEXT,
     auth            TEXT,
     created_at      TIMESTAMPTZ DEFAULT NOW()
@@ -605,6 +627,29 @@ CREATE TABLE notification_log (
     sent_at         TIMESTAMPTZ DEFAULT NOW(),
     status          VARCHAR(20) DEFAULT 'sent'
 );
+
+-- ─── OPERATIONS ──────────────────────────────────────────────
+
+CREATE TABLE ingest_log (
+    id              SERIAL PRIMARY KEY,
+    source          VARCHAR(30),       -- openf1|jolpica|…
+    task            VARCHAR(100),
+    started_at      TIMESTAMPTZ DEFAULT NOW(),
+    finished_at     TIMESTAMPTZ,
+    status          VARCHAR(20) DEFAULT 'running',  -- running|success|error
+    message         TEXT,              -- error detail / resume checkpoint
+    items_written   INTEGER DEFAULT 0
+);
+
+CREATE TABLE announcements (
+    id          SERIAL PRIMARY KEY,
+    title       VARCHAR(200),
+    body        TEXT,
+    is_active   BOOLEAN DEFAULT false,
+    starts_at   TIMESTAMPTZ,
+    ends_at     TIMESTAMPTZ,
+    created_by  UUID REFERENCES users(id)
+);
 ```
 
 ### 5.2 Indexes
@@ -617,6 +662,9 @@ CREATE INDEX idx_lap_times_session_driver ON lap_times(session_id, driver_id);
 CREATE INDEX idx_user_favourites_user ON user_favourites(user_id);
 CREATE INDEX idx_notification_prefs_user ON notification_preferences(user_id);
 CREATE INDEX idx_live_state_session ON live_session_state(session_id);
+CREATE INDEX idx_notif_log_sent_at ON notification_log(sent_at DESC);
+CREATE INDEX idx_notif_log_status ON notification_log(status);
+CREATE INDEX idx_ingest_log_source_time ON ingest_log(source, started_at DESC);
 ```
 
 ---
@@ -639,6 +687,10 @@ GET  /<series>/rounds/<n>/race/       → Race result + pit stops + fastest laps
 GET  /<series>/rounds/<n>/qualifying/ → Qualifying result (Q1/Q2/Q3)
 GET  /<series>/rounds/<n>/live/       → Live timing page (SSE-driven)
 GET  /drivers/<slug>/                 → Driver profile + career stats
+GET  /privacy/                        → Privacy policy (GDPR)
+GET  /robots.txt                      → robots.txt (template-rendered)
+GET  /sitemap.xml                     → django.contrib.sitemaps
+GET  /healthz                         → JSON health: DB + Redis ping (Docker healthchecks)
 ```
 
 ### 6.2 HTMX Fragment Endpoints (partials)
@@ -734,32 +786,72 @@ data: {"message":"Max Verstappen just set fastest lap (Lap 44)",
        "event_type":"fastest_lap","driver_slug":"max-verstappen"}
 ```
 
+`timing_update`, `flag_change`, and `standings_update` broadcast on shared channels (`live:<id>`, `standings:<series>`). `personal_alert` is **never** mixed into shared streams — it publishes to a per-user channel (`user:<id>:alerts`) and is delivered only on the authenticated `/sse/alerts/` stream.
+
 ### 7.4 Async SSE View (Simplified)
+
+```python
+# apps/live/sse.py — per-process broadcast hub: ONE Redis pub/sub connection
+# per Uvicorn worker fans out to every local SSE client (O(workers) Redis
+# connections, not O(viewers)).
+import asyncio
+import redis.asyncio as aioredis
+from django.conf import settings
+
+_redis = None
+_subscribers: dict[str, set[asyncio.Queue]] = {}
+_listener_task = None
+
+def get_redis():
+    global _redis
+    if _redis is None:
+        _redis = aioredis.from_url(settings.REDIS_URL)  # pooled, shared per worker
+    return _redis
+
+async def _listener():
+    pubsub = get_redis().pubsub()
+    await pubsub.psubscribe("live:*", "standings:*", "user:*")
+    async for msg in pubsub.listen():
+        if msg["type"] == "pmessage":
+            for q in _subscribers.get(msg["channel"].decode(), ()):
+                q.put_nowait(msg["data"].decode())
+
+async def subscribe(channel: str) -> asyncio.Queue:
+    global _listener_task
+    if _listener_task is None:
+        _listener_task = asyncio.get_running_loop().create_task(_listener())
+    q = asyncio.Queue()
+    _subscribers.setdefault(channel, set()).add(q)
+    return q
+
+def unsubscribe(channel: str, q: asyncio.Queue):
+    _subscribers.get(channel, set()).discard(q)
+```
 
 ```python
 # apps/live/views.py
 import asyncio
-import redis.asyncio as aioredis
 from django.http import StreamingHttpResponse
-from django.conf import settings
+from .sse import get_redis, subscribe, unsubscribe
 
 async def live_session_stream(request, session_id: int):
+    channel = f"live:{session_id}"
+
     async def event_stream():
-        r = aioredis.from_url(settings.REDIS_URL)
-        pubsub = r.pubsub()
-        await pubsub.subscribe(f"live:{session_id}")
+        q = await subscribe(channel)
         try:
             # Initial snapshot so late joiners aren't blank
-            snapshot = await r.get(f"live:{session_id}:snapshot")
+            snapshot = await get_redis().get(f"{channel}:snapshot")
             if snapshot:
                 yield f"event: timing_update\ndata: {snapshot.decode()}\n\n"
-            async for message in pubsub.listen():
-                if message["type"] == "message":
-                    yield message["data"].decode() + "\n\n"
-                # Heartbeat comment keeps proxies from closing the stream
+            while True:
+                try:
+                    frame = await asyncio.wait_for(q.get(), timeout=15)
+                    yield frame + "\n\n"
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"  # 15s heartbeat — survives nginx/mobile idle timeouts
         finally:
-            await pubsub.unsubscribe(f"live:{session_id}")
-            await r.aclose()
+            unsubscribe(channel, q)
 
     response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
     response["Cache-Control"] = "no-cache"
@@ -767,7 +859,7 @@ async def live_session_stream(request, session_id: int):
     return response
 ```
 
-The Celery poller publishes pre-formatted SSE frames (`event: …\ndata: …`) and also writes the latest snapshot to a Redis key so new connections render immediately. A 15-second heartbeat comment (`: ping`) is interleaved to keep idle connections alive.
+The Celery poller publishes pre-formatted SSE frames (`event: …\ndata: …`) and also writes the latest snapshot to a Redis key so new connections render immediately. Because Redis pub/sub broadcasts to **every** subscriber, the hub makes multi-worker Uvicorn safe: each worker holds exactly one pub/sub connection regardless of viewer count.
 
 ### 7.5 Client Side (HTMX SSE extension)
 
@@ -827,6 +919,13 @@ SOCIALACCOUNT_PROVIDERS = {
         'AUTH_PARAMS': {'access_type': 'online'},
     },
 }
+
+# Brute-force protection — allauth's built-in rate limiting (no extra deps)
+ACCOUNT_RATE_LIMITS = {
+    'login_failed': '5/5m/ip',
+    'signup': '10/h/ip',
+    'reset_password': '5/h/ip',
+}
 ```
 
 ### 8.4 User Roles
@@ -836,6 +935,12 @@ SOCIALACCOUNT_PROVIDERS = {
 | `user` | Browse, personalise, notifications, share |
 | `moderator` | View reports, hide/flag content (maps to Django `is_staff` + group) |
 | `admin` | Django admin, data management, broadcast notifications (`is_superuser` or admin group) |
+
+### 8.5 Privacy & GDPR
+
+- **Cookie consent banner:** first-visit banner (small Alpine component in `base.html`; choice stored in a `pw_consent` cookie + localStorage). V1 sets only strictly-necessary cookies (session, CSRF, theme), so the banner is informational with a single "Got it" action until analytics are ever added. The web-push permission prompt is shown only after an explicit user gesture, never on page load.
+- **Privacy page:** `/privacy/` template stub — data collected, retention, contact.
+- **Account deletion:** self-service in `/settings/` — favourites, preferences, push subscriptions, and notification log cascade via `ON DELETE CASCADE`, then the user row is deleted.
 
 ---
 
@@ -895,8 +1000,8 @@ def send_push(subscription, title, body, url=None, icon=None):
             vapid_claims={"sub": f"mailto:{settings.VAPID_EMAIL}"},
         )
     except WebPushException as e:
-        if e.response is not None and e.response.status_code == 410:
-            subscription.delete()  # expired subscription
+        if e.response is not None and e.response.status_code in (404, 410):
+            subscription.delete()  # endpoint expired or gone
 ```
 
 The service worker (`static/js/sw.js`) handles `push` + `notificationclick`, and doubles as the PWA offline worker in Phase 4.
@@ -938,16 +1043,21 @@ When a race session is marked FINISHED, a Celery task generates shareable image 
 
 ```python
 # apps/sharing/generators.py
+from django.conf import settings
 from PIL import Image, ImageDraw, ImageFont
 
 def generate_race_winner_card(session_id):
     result = RaceResult.objects.get(session_id=session_id, position=1)
-    img = Image.open('apps/sharing/card_templates/race_winner_bg.png')
+    # Absolute paths only — CWD is unpredictable inside containers
+    template = settings.BASE_DIR / 'apps/sharing/card_templates/race_winner_bg.png'
+    img = Image.open(template)
     draw = ImageDraw.Draw(img)
     # Draw driver name, time, team colour strip, round name
-    path = f'media/cards/race_{session_id}_winner.webp'
+    out_dir = settings.MEDIA_ROOT / 'cards'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f'race_{session_id}_winner.webp'
     img.save(path, 'WEBP', quality=85)
-    return path
+    return f'{settings.MEDIA_URL}cards/{path.name}'
 ```
 
 ### 10.2 User-Triggered Custom Cards
@@ -988,7 +1098,7 @@ ffmpeg -loop 1 -i bg_frame.png \
        output.mp4
 ```
 
-> Video rendering is CPU-heavy on a single VPS — cap Celery concurrency for render tasks (dedicated low-concurrency queue) so it never competes with live polling during a race.
+> Video rendering is CPU-heavy on a single VPS — the `celery_render` service runs `-c 1 -Q render` with hard caps (`cpus: "1.0"`, `mem_limit: 1g`) so it never competes with live polling during a race.
 
 ---
 
@@ -1122,6 +1232,11 @@ services:
       POSTGRES_DB: pitwall
       POSTGRES_USER: pitwall
       POSTGRES_PASSWORD: ${DB_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pitwall"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks: [pitwall_net]
     restart: unless-stopped
 
@@ -1129,6 +1244,11 @@ services:
     image: redis:7-alpine
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks: [pitwall_net]
     restart: unless-stopped
 
@@ -1136,6 +1256,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.prod
+    # Multi-worker is SSE-safe: each worker runs its own fan-out hub (§7.4)
     command: uvicorn pitwall.asgi:application --host 0.0.0.0 --port 8000 --workers 4
     environment:
       - DATABASE_URL=postgresql://pitwall:${DB_PASSWORD}@postgres:5432/pitwall
@@ -1145,6 +1266,11 @@ services:
     volumes:
       - django_static:/app/staticfiles
       - django_media:/app/media
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     depends_on: [postgres, redis]
     networks: [pitwall_net]
     restart: unless-stopped
@@ -1169,6 +1295,10 @@ services:
       context: .
       dockerfile: Dockerfile.prod
     command: celery -A pitwall beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    environment:
+      - DATABASE_URL=postgresql://pitwall:${DB_PASSWORD}@postgres:5432/pitwall
+      - REDIS_URL=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=pitwall.settings.production
     depends_on: [postgres, redis]
     networks: [pitwall_net]
     restart: unless-stopped
@@ -1198,7 +1328,7 @@ networks:
     driver: bridge
 ```
 
-(A render-heavy `celery_render` service with `-c 1 -Q render` is added in Phase 3 for FFmpeg jobs.)
+(Phase 3 adds a `celery_render` service: same image, `celery -A pitwall worker -l info -c 1 -Q render`, with `cpus: "1.0"` and `mem_limit: 1g` so FFmpeg renders never starve live polling.)
 
 ### 13.3 Nginx Configuration
 
@@ -1220,6 +1350,7 @@ server {
         proxy_pass http://django_asgi;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_http_version 1.1;
         proxy_buffering off;
         proxy_cache off;
@@ -1252,16 +1383,21 @@ server {
 }
 ```
 
+Two companion requirements:
+
+- **Django must trust the proxy** (production settings): `SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')` and `USE_X_FORWARDED_HOST = True` — otherwise `request.is_secure()` is `False` behind nginx, breaking allauth redirects and CSRF.
+- **SSE capacity:** each viewer holds one open connection. For the 500-concurrent load target, raise `worker_connections` to 4096 in the main `nginx.conf` `events` block.
+
 ### 13.4 CI/CD with Dokploy
 
 1. Push to `main` branch on GitHub
 2. Dokploy webhook fires → pulls latest code
 3. `docker-compose.prod.yml` runs `docker build` for changed services
 4. Rolling restart of django + workers
-5. Post-deploy hook:
+5. Post-deploy hook (service name, not container name — compose-generated names vary):
    ```bash
-   docker exec pitwall_django_1 python manage.py migrate --no-input
-   docker exec pitwall_django_1 python manage.py collectstatic --no-input
+   docker compose exec django python manage.py migrate --no-input
+   docker compose exec django python manage.py collectstatic --no-input
    ```
 
 ### 13.5 Backup Strategy
@@ -1271,6 +1407,8 @@ server {
 - Retention: 7 daily + 4 weekly
 - Media (generated cards): retained 30 days, auto-purged by Celery task
 - Redis: snapshots every 60s (default), data is ephemeral-safe (cache only)
+- Known limitation: media is served straight off the VPS by nginx — no CDN /
+  object storage in v1; revisit if post-race download spikes saturate bandwidth
 ```
 
 ### 13.6 Environment Variables (.env.example)
@@ -1284,7 +1422,10 @@ DJANGO_SETTINGS_MODULE=pitwall.settings.production
 
 # Database
 DB_PASSWORD=
-DATABASE_URL=postgresql://pitwall:${DB_PASSWORD}@postgres:5432/pitwall
+# NOTE: .env files do NOT expand ${…} — never reference other vars here.
+# In Docker, compose builds DATABASE_URL from DB_PASSWORD (see
+# docker-compose.prod.yml). This literal URL is for local dev outside Docker:
+DATABASE_URL=postgresql://pitwall:pitwall@localhost:5432/pitwall
 
 # Redis
 REDIS_URL=redis://redis:6379/0
@@ -1324,10 +1465,10 @@ JOLPICA_BASE_URL=https://api.jolpi.ca/ergast
 | 1.5 | Homepage + F1 series hub + standings pages |
 | 1.6 | Calendar + results list pages |
 | 1.7 | F1 round pages: race result, qualifying, pit stops, sector times |
-| 1.8 | Live polling dispatcher + SSE endpoint (F1 session) |
+| 1.8 | Live polling dispatcher + SSE endpoint + `simulate_live` replay simulator |
 | 1.9 | Live timing page (HTMX SSE fragments) |
 | 1.10 | Driver profile pages |
-| 1.11 | Dokploy deployment, domain config, SSL |
+| 1.11 | Deployment docs — `docs/DEPLOY.md` (Dokploy, domain, SSL); actual VPS provisioning deferred to launch |
 
 **Milestone:** PitWall is live with F1 real-time coverage
 
@@ -1500,4 +1641,4 @@ Post-launch series add their own beat entries + dispatcher rules (e.g., WRC stag
 
 ---
 
-*PitWall Blueprint v1.1 — Ready to build. Start with Phase 1. 🏁*
+*PitWall Blueprint v1.2 — Ready to build. Start with Phase 1. 🏁*
