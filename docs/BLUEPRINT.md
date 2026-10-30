@@ -1,5 +1,7 @@
 # PitWall — Full Product & Technical Blueprint
-> Unified Motorsport Stats Hub · Version 1.3 · October 2026
+> Unified Motorsport Stats Hub · Version 1.4 · October 2026
+
+**Changes in v1.4:** §8.5 deletion prose matches `notification_log` SET NULL; `.env.example` `REDIS_URL` uses localhost for out-of-Docker dev.
 
 **Changes in v1.3:** active-pairing partial unique index + ingest flip rule, `notification_log` GDPR-safe FK, SSE fan-out snapshot iteration, `docs/` added to project tree.
 
@@ -971,7 +973,7 @@ ACCOUNT_RATE_LIMITS = {
 
 - **Cookie consent banner:** first-visit banner (small Alpine component in `base.html`; choice stored in a `pw_consent` cookie + localStorage). V1 sets only strictly-necessary cookies (session, CSRF, theme), so the banner is informational with a single "Got it" action until analytics are ever added. The web-push permission prompt is shown only after an explicit user gesture, never on page load.
 - **Privacy page:** `/privacy/` template stub — data collected, retention, contact.
-- **Account deletion:** self-service in `/settings/` — favourites, preferences, push subscriptions, and notification log cascade via `ON DELETE CASCADE`, then the user row is deleted.
+- **Account deletion:** self-service in `/settings/` — favourites, preferences, and push subscriptions cascade via `ON DELETE CASCADE`; notification log rows are de-identified (`user_id` set to NULL, preserving the audit trail); then the user row is deleted.
 
 ---
 
@@ -1461,7 +1463,9 @@ DB_PASSWORD=
 DATABASE_URL=postgresql://pitwall:pitwall@localhost:5432/pitwall
 
 # Redis
-REDIS_URL=redis://redis:6379/0
+# Compose overrides this with redis://redis:6379/0 in-network; this literal
+# URL is for local dev outside Docker:
+REDIS_URL=redis://localhost:6379/0
 
 # SMTP
 SMTP_HOST=
