@@ -1,5 +1,7 @@
 # PitWall — Full Product & Technical Blueprint
-> Unified Motorsport Stats Hub · Version 1.4 · October 2026
+> Unified Motorsport Stats Hub · Version 1.5 · October 2026
+
+**Changes in v1.5:** idempotency UNIQUE keys on WRC/NASCAR stage results; footer version tag fixed.
 
 **Changes in v1.4:** §8.5 deletion prose matches `notification_log` SET NULL; `.env.example` `REDIS_URL` uses localhost for out-of-Docker dev.
 
@@ -560,7 +562,8 @@ CREATE TABLE wrc_stage_results (
     stage_position  INTEGER,
     overall_position INTEGER,
     gap_to_leader_ms BIGINT,
-    power_stage_points INTEGER DEFAULT 0
+    power_stage_points INTEGER DEFAULT 0,
+    UNIQUE(stage_id, driver_id)
 );
 
 -- ─── NASCAR-SPECIFIC: STAGE POINTS (populated post-launch) ──
@@ -572,7 +575,8 @@ CREATE TABLE nascar_stage_results (
     stage_number    INTEGER,   -- 1, 2, 3
     stage_position  INTEGER,
     stage_points    INTEGER,
-    laps_led        INTEGER DEFAULT 0
+    laps_led        INTEGER DEFAULT 0,
+    UNIQUE(session_id, driver_id, stage_number)
 );
 
 -- ─── LIVE SESSION STATE ──────────────────────────────────────
@@ -1678,4 +1682,4 @@ Post-launch series add their own beat entries + dispatcher rules (e.g., WRC stag
 
 ---
 
-*PitWall Blueprint v1.2 — Ready to build. Start with Phase 1. 🏁*
+*PitWall Blueprint v1.5 — Ready to build. Start with Phase 1. 🏁*
